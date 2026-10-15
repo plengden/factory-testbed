@@ -38,6 +38,15 @@ npm start            # http://localhost:3000, in-memory database
 
 Render's free instances have no persistent disk, so data resets on every deploy or restart. That is fine for a testbed.
 
+## Environments
+
+| Environment | URL | Deploys |
+|---|---|---|
+| staging | https://factory-testbed-staging.onrender.com | `deploy.yml` from `main`; no approval |
+| production | https://factory-testbed.onrender.com | `deploy.yml` from `main`, only a digest that passed staging; owner approval |
+
+Both are Render free instances running the image from GHCR by digest. `/healthz` shows which commit is live.
+
 ## CI and deploys
 
 - **`ci.yml`** runs on every pull request and every push to `main`:

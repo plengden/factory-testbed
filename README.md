@@ -62,7 +62,26 @@ Both are Render free instances running the image from GHCR by digest. `/healthz`
   On `main`, `publish` pushes the image to GHCR and records its digest.
 - **`deploy.yml`** (manual or gateway-triggered) deploys that exact digest to Render staging or production, then smoke-tests the live URL. Production requires the same digest to have passed staging, and a human approves the production environment.
 
+  After the smoke test it records the release in Sentry, on a best-effort basis:
+  - every deploy creates the release (named by commit sha) and a Sentry deploy to that environment;
+  - the staging deploy attaches the commits since the previous release, read from local git, so Sentry needs no GitHub integration;
+  - the production deploy finalizes the release;
+  - a rollback only records the deploy.
+
+  A Sentry outage does not fail a deploy, but a deploy fails before it reaches Render if the Sentry settings are missing.
+
 Changes under `.github/`, `migrations/`, `src/auth/`, the Dockerfile, dependency files and tool configs are class `high`. So are changes that delete or skip tests, or add suppressions.
+
+## Sentry settings
+
+| Where | Name | Value |
+|---|---|---|
+| Render, each service | `SENTRY_DSN` | The project's DSN |
+| Render, each service | `APP_ENV` | `staging` or `production`: the Sentry environment |
+| GitHub environments `staging` and `production` | secret `SENTRY_AUTH_TOKEN` | A Sentry organization token (CI scopes only) |
+| GitHub environments `staging` and `production` | vars `SENTRY_ORG`, `SENTRY_PROJECT` | The organization and project slugs |
+
+The token is stored only on the two environments, and only `main` can deploy to them, so pull-request runs never see it. No source maps are uploaded: Node runs the `.ts` sources as they are, so stack traces already point at source lines.
 
 ## Known gaps (good first factory tickets)
 

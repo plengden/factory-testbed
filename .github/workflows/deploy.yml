@@ -11,6 +11,11 @@ run-name: ${{ inputs.action }} ${{ inputs.releaseId }} ${{ inputs.artifactDigest
 #   4. the environment's own protection (production has a required reviewer).
 # releaseId is the full commit sha; /healthz reports it, which is how the smoke test knows the new build is live.
 # riskClass uses the gateway's deploy-policy scale (low|medium|high): docs→low, standard→medium, high→high.
+# Sentry, recorded after the smoke test and best effort (a Sentry outage never turns a live deploy red):
+#   - every deploy creates the release (the commit sha, as RELEASE in the image) and records a Sentry deploy;
+#   - the staging deploy attaches the commits since the previous release, read from local git;
+#   - the production deploy finalizes the release; a rollback only records the deploy.
+# A deploy without the Sentry settings fails before Render is touched; a rollback never depends on Sentry.
 on:
   workflow_dispatch:
     inputs:
@@ -41,6 +46,10 @@ on:
 
 permissions:
   contents: read
+
+env:
+  # sentry-cli runs as an image pinned by digest, like CI's scanners, so no third-party action sees the token.
+  SENTRY_CLI: getsentry/sentry-cli:3.8.0@sha256:973a77ecc96852081f946e36a8f090ed74a02249009594aff51575e593871427
 
 concurrency:
   group: deploy-${{ inputs.environment }}
@@ -110,6 +119,22 @@ jobs:
       name: ${{ inputs.environment }}
       url: ${{ vars.APP_URL }}
     steps:
+      - name: Sentry settings are present
+        if: inputs.action == 'deploy'
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
+        run: |
+          for v in SENTRY_AUTH_TOKEN SENTRY_ORG SENTRY_PROJECT; do
+            [[ -n "${!v}" ]] || { echo "::error::$v is not set for this environment"; exit 1; }
+          done
+
+      - name: Check out the release (git history for Sentry's commit list; nothing in it is run)
+        if: inputs.action == 'deploy' && inputs.environment == 'staging'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { ref: '${{ inputs.releaseId }}', fetch-depth: 0, persist-credentials: false }
+
       - name: Trigger the Render deploy hook with the pinned image
         env:
           HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
@@ -136,6 +161,33 @@ jobs:
           [[ "$live" == "$RELEASE" ]] || { echo "::error::$APP_URL still reports '${live:-nothing}', expected $RELEASE"; exit 1; }
           code=$(curl -s -o /dev/null -w '%{http_code}' "$APP_URL/notes")
           [[ "$code" == "401" ]] || { echo "::error::/notes without a token answered $code, expected 401"; exit 1; }
+
+      - name: Record the release and deploy in Sentry
+        # The build is live and smoke-tested by now. A failure here is reported, but the deploy stays green,
+        # because a red deploy would block promoting or rolling back to this digest.
+        continue-on-error: true
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
+          ACTION: ${{ inputs.action }}
+          RELEASE: ${{ inputs.releaseId }}
+          TARGET: ${{ inputs.environment }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          sentry() {
+            docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" -w /work \
+              -e SENTRY_AUTH_TOKEN -e SENTRY_ORG -e SENTRY_PROJECT "$SENTRY_CLI" "$@"
+          }
+          if [[ "$ACTION" == "deploy" ]]; then
+            sentry releases new "$RELEASE"
+            case "$TARGET" in
+              staging) sentry releases set-commits "$RELEASE" --local ;;  # commits since the previous release
+              production) sentry releases finalize "$RELEASE" ;;
+            esac
+          fi
+          sentry deploys new --release "$RELEASE" --env "$TARGET" --name "$ACTION run ${{ github.run_id }}" --url "$RUN_URL"
+          echo "Sentry: release \`$RELEASE\` recorded as a $ACTION to $TARGET" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Record
         env:

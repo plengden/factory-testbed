@@ -1,0 +1,159 @@
+name: deploy
+
+run-name: ${{ inputs.action }} ${{ inputs.releaseId }} ${{ inputs.artifactDigest }} -> ${{ inputs.environment }}
+
+# Deploys a published image BY DIGEST to Render (Factory-Design.md §3 CI "Deploy").
+# Triggered only by workflow_dispatch: by the Paperclip deploy tool (gateway-held) or by a human.
+# Locks, in order:
+#   1. deploy: the commit is on main, its ci-gate passed, and the digest is exactly what CI published for it;
+#   2. production: the same digest already deployed to staging successfully (smoke passed);
+#   3. rollback: the digest was previously deployed to that environment successfully;
+#   4. the environment's own protection (production has a required reviewer).
+# releaseId is the full commit sha; /healthz reports it, which is how the smoke test knows the new build is live.
+# riskClass uses the gateway's deploy-policy scale (low|medium|high): docs→low, standard→medium, high→high.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: deploy or rollback
+        required: true
+        default: deploy
+        type: choice
+        options: [deploy, rollback]
+      releaseId:
+        description: Full commit sha of the build to deploy
+        required: true
+        type: string
+      artifactDigest:
+        description: Image digest published by CI for that commit (sha256:<64 hex>)
+        required: true
+        type: string
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [staging, production]
+      riskClass:
+        description: Risk class (gateway deploy-policy scale)
+        required: true
+        type: choice
+        options: [low, medium, high]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    steps:
+      - name: Validate inputs
+        env:
+          RELEASE: ${{ inputs.releaseId }}
+          DIGEST: ${{ inputs.artifactDigest }}
+        run: |
+          [[ "$RELEASE" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::releaseId must be a full commit sha"; exit 1; }
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::artifactDigest must be sha256:<64 hex>"; exit 1; }
+          [[ "${{ github.ref }}" == "refs/heads/main" ]] || { echo "::error::dispatch from main only"; exit 1; }
+
+      - name: Commit is on main, ci-gate passed, digest is what CI published
+        if: inputs.action == 'deploy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE: ${{ inputs.releaseId }}
+          DIGEST: ${{ inputs.artifactDigest }}
+        run: |
+          status=$(gh api "repos/$REPO/compare/$RELEASE...main" --jq .status)
+          [[ "$status" == "ahead" || "$status" == "identical" ]] || { echo "::error::$RELEASE is not on main ($status)"; exit 1; }
+          gate=$(gh api "repos/$REPO/commits/$RELEASE/check-runs?check_name=ci-gate&per_page=100" --jq '[.check_runs[].conclusion]|first // "missing"')
+          [[ "$gate" == "success" ]] || { echo "::error::ci-gate is '$gate' for $RELEASE"; exit 1; }
+          run=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$RELEASE&event=push&status=success&per_page=1" --jq '.workflow_runs[0].id // empty')
+          [[ -n "$run" ]] || { echo "::error::no successful push CI run for $RELEASE"; exit 1; }
+          published=$(gh api "repos/$REPO/actions/runs/$run/artifacts" --jq '[.artifacts[].name|select(startswith("app-sha256-"))]|first // ""')
+          [[ "$published" == "app-sha256-${DIGEST#sha256:}" ]] || { echo "::error::$DIGEST is not the image CI published for $RELEASE ($published)"; exit 1; }
+
+      - name: Production needs the same digest to have passed staging
+        if: inputs.action == 'deploy' && inputs.environment == 'production'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DIGEST: ${{ inputs.artifactDigest }}
+        run: |
+          n=$(gh api "repos/$REPO/actions/workflows/deploy.yml/runs?status=success&per_page=100" \
+            --jq "[.workflow_runs[].display_title | select(startswith(\"deploy \") and contains(\" $DIGEST \") and endswith(\"-> staging\"))] | length")
+          [[ "$n" -gt 0 ]] || { echo "::error::$DIGEST has no successful staging deploy"; exit 1; }
+
+      - name: Rollback target was deployed to this environment before
+        if: inputs.action == 'rollback'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DIGEST: ${{ inputs.artifactDigest }}
+          TARGET: ${{ inputs.environment }}
+        run: |
+          n=$(gh api "repos/$REPO/actions/workflows/deploy.yml/runs?status=success&per_page=100" \
+            --jq "[.workflow_runs[].display_title | select(contains(\" $DIGEST \") and endswith(\"-> $TARGET\"))] | length")
+          [[ "$n" -gt 0 ]] || { echo "::error::$DIGEST was never deployed to $TARGET successfully"; exit 1; }
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.APP_URL }}
+    steps:
+      - name: Trigger the Render deploy hook with the pinned image
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+          IMAGE: ghcr.io/${{ github.repository }}@${{ inputs.artifactDigest }}
+        run: |
+          [[ -n "$HOOK" ]] || { echo "::error::RENDER_DEPLOY_HOOK is not set for this environment"; exit 1; }
+          img=$(jq -rn --arg v "$IMAGE" '$v|@uri')
+          code=$(curl -sS -o render.json -w '%{http_code}' -X POST "$HOOK&imgURL=$img")
+          [[ "$code" == "200" || "$code" == "202" ]] || { echo "::error::Render answered HTTP $code"; exit 1; }
+          echo "Render deploy: $(jq -r '.deploy.id // "queued behind an earlier deploy"' render.json)"
+
+      - name: Smoke test the live build
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+          RELEASE: ${{ inputs.releaseId }}
+        run: |
+          [[ "$APP_URL" =~ ^https:// ]] || { echo "::error::APP_URL is not set for this environment"; exit 1; }
+          # Free instances cold-start and image deploys take minutes: wait up to 15 min for /healthz to report this build.
+          for _ in $(seq 1 90); do
+            live=$(curl -s -m 20 "$APP_URL/healthz" | jq -r '.release // empty' 2>/dev/null || true)
+            [[ "$live" == "$RELEASE" ]] && break
+            sleep 10
+          done
+          [[ "$live" == "$RELEASE" ]] || { echo "::error::$APP_URL still reports '${live:-nothing}', expected $RELEASE"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$APP_URL/notes")
+          [[ "$code" == "401" ]] || { echo "::error::/notes without a token answered $code, expected 401"; exit 1; }
+
+      - name: Record
+        env:
+          ACTION: ${{ inputs.action }}
+          RELEASE: ${{ inputs.releaseId }}
+          DIGEST: ${{ inputs.artifactDigest }}
+          TARGET: ${{ inputs.environment }}
+          RISK: ${{ inputs.riskClass }}
+        run: |
+          {
+            echo "## Deployment record"
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| action | $ACTION |"
+            echo "| release | $RELEASE |"
+            echo "| image | ghcr.io/${{ github.repository }}@$DIGEST |"
+            echo "| environment | $TARGET |"
+            echo "| riskClass | $RISK |"
+            echo "| actor | ${{ github.actor }} |"
+            echo "| run | ${{ github.run_id }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

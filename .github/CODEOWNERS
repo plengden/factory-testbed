@@ -1,0 +1,13 @@
+# Default owner for everything.
+* @plengden
+
+# Protected paths (Factory-Constitution.md "Boundaries"): humans own these. Agents never change them;
+# the gateway's pr_publish denylist and the risk classifier enforce that independently of this file.
+/.github/ @plengden
+/CODEOWNERS @plengden
+/policy/ @plengden
+/.claude/ @plengden
+**/AGENTS.md @plengden
+**/CLAUDE.md @plengden
+/Dockerfile @plengden
+/migrations/ @plengden

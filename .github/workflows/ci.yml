@@ -1,0 +1,219 @@
+name: ci
+
+# Required checks (Factory-Design.md §3 "CI in the testbed").
+# - `ci-gate` is the single status branch protection requires and deploy.yml verifies.
+# - Paperclip's ci_evidence tool reads the job names test/secrets/sast/deps/build/ci-gate and the artifacts
+#   app-sha256-<hex> and risk-class-<class>.
+# - Pull-request runs are read-only and get no secrets. Only `publish` (push to main) may write packages.
+# - Every action is GitHub's own and pinned by commit SHA; scanners run as images pinned by digest.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version-file: .nvmrc }
+      - name: Lockfile sources and exact version pins (before any install)
+        run: node .github/scripts/lockfile-check.mjs
+      - name: CI script tests
+        run: node --test .github/scripts/scripts.test.mjs
+
+  test:
+    needs: [vet]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version-file: .nvmrc }
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+
+  lint:
+    needs: [vet]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version-file: .nvmrc }
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run lint
+      - run: npm run typecheck
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0, persist-credentials: false }
+      - name: gitleaks (full history)
+        run: >
+          docker run --rm -v "$PWD:/repo"
+          ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          detect --source=/repo --redact --no-banner
+
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: semgrep
+        run: >
+          docker run --rm -v "$PWD:/src" -w /src
+          semgrep/semgrep:1.181.0@sha256:81474464c1f07483ba0682a44787fd93c91397419762a04abe2bafaae396304b
+          semgrep scan --config p/javascript --config p/typescript --config p/secrets
+          --error --metrics=off src .github
+
+  deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: trivy (dependencies, secrets, Dockerfile misconfiguration)
+        run: >
+          docker run --rm -v "$PWD:/src"
+          aquasec/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
+          fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 --no-progress /src
+
+  build:
+    # Builds the image on every run. On pull requests the recorded digest is the local image id (never
+    # pushed, never deployable); on main, `publish` records the registry digest that deploys use.
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - id: b
+        name: docker build
+        run: |
+          docker build --build-arg RELEASE="${{ github.sha }}" -t "$IMAGE:ci" .
+          id=$(docker image inspect --format '{{.Id}}' "$IMAGE:ci")
+          echo "$id" > image-id.txt
+          echo "hex=${id#sha256:}" >> "$GITHUB_OUTPUT"
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: { name: 'app-sha256-${{ steps.b.outputs.hex }}', path: image-id.txt }
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, lint, secrets, sast, deps, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - id: p
+        name: Build and push to GHCR, record the registry digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx build --push --provenance=false \
+            --build-arg RELEASE="${{ github.sha }}" \
+            --label org.opencontainers.image.source="https://github.com/${{ github.repository }}" \
+            --label org.opencontainers.image.revision="${{ github.sha }}" \
+            -t "$IMAGE:sha-${{ github.sha }}" --metadata-file meta.json .
+          digest=$(jq -r '."containerimage.digest"' meta.json)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest in build metadata"; exit 1; }
+          echo "$IMAGE@$digest" > image-ref.txt
+          echo "hex=${digest#sha256:}" >> "$GITHUB_OUTPUT"
+          echo "### Published \`$IMAGE@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: { name: 'app-sha256-${{ steps.p.outputs.hex }}', path: image-ref.txt }
+
+  risk-class:
+    # The class only goes up. The rules run from the BASE branch, so a pull request cannot rewrite the
+    # classifier (or the weakened-bar detector) to lower its own class.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      class: ${{ steps.c.outputs.class }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0, persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version-file: .nvmrc }
+      - id: c
+        name: Classify with the base branch's rules
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/rules"
+          for f in classify.mjs weakened.mjs; do
+            git show "$BASE:.github/scripts/$f" > "$RUNNER_TEMP/rules/$f"
+          done
+          node "$RUNNER_TEMP/rules/weakened.mjs" "$BASE" "$HEAD" > weakened.json
+          node "$RUNNER_TEMP/rules/classify.mjs" "$BASE" "$HEAD" --findings weakened.json | tee risk-class.json
+          echo "class=$(jq -r .class risk-class.json)" >> "$GITHUB_OUTPUT"
+          { echo "### Risk class: $(jq -r .class risk-class.json)"; jq -r '.reasons[] | "- " + .' risk-class.json; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: { name: 'risk-class-${{ steps.c.outputs.class }}', path: risk-class.json }
+
+  pr-contract:
+    # Agent pull requests only: PR body sections and commit trailers (Factory-Constitution.md). Base-branch rules.
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'agent/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0, persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version-file: .nvmrc }
+      - name: PR body and trailers
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          git show "$BASE:.github/scripts/pr-contract.mjs" > "$RUNNER_TEMP/pr-contract.mjs"
+          node "$RUNNER_TEMP/pr-contract.mjs" "$BASE" "$HEAD"
+
+  human-gate:
+    # Human merge gate for class `high`: waits for the required reviewer of the `high-risk-merge` environment.
+    needs: [risk-class]
+    if: needs.risk-class.outputs.class == 'high'
+    runs-on: ubuntu-latest
+    environment: high-risk-merge
+    steps:
+      - run: echo "Human approval recorded by the high-risk-merge environment reviewer."
+
+  ci-gate:
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [vet, test, lint, secrets, sast, deps, build, publish, risk-class, pr-contract, human-gate]
+    steps:
+      - name: All required checks must be success (or legitimately skipped)
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[]|"\(.key): \(.value.result)"'
+          echo "$RESULTS" | jq -e --arg ev "$EVENT" --arg ref "$HEAD_REF" '
+            .["risk-class"] as $rc
+            | to_entries | all(.[];
+                .value.result == "success"
+                or (.value.result == "skipped" and (
+                     ($ev != "pull_request" and (.key == "risk-class" or .key == "pr-contract" or .key == "human-gate"))
+                  or ($ev == "pull_request" and .key == "publish")
+                  or ($ev == "pull_request" and .key == "pr-contract" and ($ref | startswith("agent/") | not))
+                  or ($ev == "pull_request" and .key == "human-gate" and $rc.result == "success" and $rc.outputs.class != "high"))))' > /dev/null

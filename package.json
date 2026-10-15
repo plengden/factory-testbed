@@ -1,0 +1,29 @@
+{
+  "name": "factory-testbed",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pilot service for the SDLC factory: notes API with auth and file attachments.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node --import ./src/instrument.ts src/server.ts",
+    "test": "node --test --test-reporter=spec \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "check": "npm run lint && npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@fastify/multipart": "10.1.3",
+    "@sentry/node": "11.7.0",
+    "fastify": "5.12.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.19.2",
+    "eslint": "10.12.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.2"
+  }
+}
